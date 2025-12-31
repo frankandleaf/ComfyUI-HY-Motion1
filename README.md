@@ -58,6 +58,7 @@ Load HY-Motion model.
 |-----------|-------------|
 | model_name | Select model version (1.0B or Lite 0.46B) |
 | device | Runtime device (cuda/cpu) |
+| quantization | LLM quantization mode (none/int8/int4) |
 
 ### HY-Motion Generate
 Core generation node.
@@ -90,15 +91,26 @@ HY-Motion Load Model -> HY-Motion Generate -> HY-Motion Preview
 ## Notes
 
 1. **VRAM Requirements**:
-   - HY-Motion-1.0: ~8GB+ VRAM
-   - HY-Motion-1.0-Lite: ~4GB+ VRAM
+   - HY-Motion-1.0: ~8GB+ VRAM (model only)
+   - HY-Motion-1.0-Lite: ~4GB+ VRAM (model only)
+   - Qwen3-8B Text Encoder (additional):
+     - `quantization=none`: ~16GB VRAM
+     - `quantization=int8`: ~8GB VRAM
+     - `quantization=int4`: ~4GB VRAM
 
-2. **FBX Export**: Requires additional fbxsdkpy installation:
+2. **Quantization**: Use INT8/INT4 quantization to reduce VRAM usage while maintaining quality:
+   ```
+   quantization=none  -> Full precision (best quality, highest VRAM)
+   quantization=int8  -> 8-bit quantization (recommended balance)
+   quantization=int4  -> 4-bit quantization (lowest VRAM, slight quality loss)
+   ```
+
+3. **FBX Export**: Requires additional fbxsdkpy installation:
    ```bash
    pip install fbxsdkpy --extra-index-url https://gitlab.inria.fr/api/v4/projects/18692/packages/pypi/simple
    ```
 
-3. **Text Encoder**: CLIP and Qwen3 models will be downloaded automatically on first use
+4. **Text Encoder**: CLIP and Qwen3-8B models will be downloaded automatically on first use
 
 ## License
 

@@ -7,6 +7,7 @@ from torch import Tensor
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    BitsAndBytesConfig,
     CLIPTextModel,
     CLIPTokenizer,
 )
@@ -57,6 +58,7 @@ class HYTextModel(nn.Module):
         sentence_emb_type: Optional[str] = "clipl",
         max_length_sentence_emb: int = 77,
         enable_llm_padding: bool = True,
+        quantization: Optional[str] = None,  # None, "int8", "int4"
     ) -> None:
         super().__init__()
         self.text_encoder_type = "hy_text_model"
@@ -100,8 +102,27 @@ class HYTextModel(nn.Module):
                 LLM_ENCODER_LAYOUT[llm_type]["module_path"],
                 padding_side="right",
             )
+
+            # Configure quantization
+            load_kwargs = {"low_cpu_mem_usage": True}
+            if quantization == "int8":
+                print(f"[HYTextModel] Loading LLM with INT8 quantization")
+                quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+                load_kwargs["quantization_config"] = quantization_config
+                load_kwargs["device_map"] = "auto"
+            elif quantization == "int4":
+                print(f"[HYTextModel] Loading LLM with INT4 quantization")
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                )
+                load_kwargs["quantization_config"] = quantization_config
+                load_kwargs["device_map"] = "auto"
+
             self.llm_text_encoder = LLM_ENCODER_LAYOUT[llm_type]["text_encoder_class"].from_pretrained(
-                LLM_ENCODER_LAYOUT[llm_type]["module_path"], low_cpu_mem_usage=True
+                LLM_ENCODER_LAYOUT[llm_type]["module_path"], **load_kwargs
             )
             self.llm_text_encoder = self.llm_text_encoder.eval().requires_grad_(False)
             self.ctxt_dim = self.llm_text_encoder.config.hidden_size
@@ -116,15 +137,11 @@ class HYTextModel(nn.Module):
 
         device = get_module_device(self)
         llm_text = [
-            (
-                self.llm_tokenizer.apply_chat_template(
-                    self.apply_text_to_template(one_text, LLM_ENCODER_LAYOUT[self.llm_type]["template"]),
-                    tokenize=False,
-                    add_generation_prompt=False,
-                    enable_thinking=False,
-                )
-                if self.llm_type == "qwen3"
-                else self.apply_text_to_template(one_text, LLM_ENCODER_LAYOUT[self.llm_type]["template"])
+            self.llm_tokenizer.apply_chat_template(
+                self.apply_text_to_template(one_text, LLM_ENCODER_LAYOUT[self.llm_type]["template"]),
+                tokenize=False,
+                add_generation_prompt=False,
+                enable_thinking=False,
             )
             for one_text in text
         ]
@@ -139,26 +156,17 @@ class HYTextModel(nn.Module):
             padding=padding_mode,
             return_tensors="pt",
         )
-        llm_outputs = (
-            self.llm_text_encoder(
-                input_ids=llm_batch_encoding["input_ids"].to(device),
-                attention_mask=llm_batch_encoding["attention_mask"].to(device),
-                output_hidden_states=True,
-            )
-            if self.llm_type == "qwen3"
-            else self.llm_text_encoder(
-                input_ids=llm_batch_encoding["input_ids"].to(device),
-                attention_mask=llm_batch_encoding["attention_mask"].to(device),
-            )
+        llm_outputs = self.llm_text_encoder(
+            input_ids=llm_batch_encoding["input_ids"].to(device),
+            attention_mask=llm_batch_encoding["attention_mask"].to(device),
+            output_hidden_states=True,
         )
-        if self.llm_type == "qwen3":
-            ctxt_raw = llm_outputs.hidden_states[-1].clone()
-        else:
-            ctxt_raw = llm_outputs.last_hidden_state.clone()
+        ctxt_raw = llm_outputs.hidden_states[-1].clone()
 
         start = self.crop_start
         end = start + self._orig_max_length_llm
         ctxt_raw = ctxt_raw[:, start:end].contiguous()  # [bs, _orig_max_length_llm, hidden]
+
         ctxt_length = (llm_batch_encoding["attention_mask"].sum(dim=-1).to(device) - start).clamp(
             min=0, max=self._orig_max_length_llm
         )
@@ -230,13 +238,10 @@ class HYTextModel(nn.Module):
             return -1
 
         marker = "<BOC>"
-        if self.llm_type == "qwen3":
-            msgs = self.apply_text_to_template(marker, LLM_ENCODER_LAYOUT[self.llm_type]["template"])
-            s = self.llm_tokenizer.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=False, enable_thinking=False
-            )
-        else:
-            s = self.apply_text_to_template(marker, LLM_ENCODER_LAYOUT[self.llm_type]["template"])
+        msgs = self.apply_text_to_template(marker, LLM_ENCODER_LAYOUT[self.llm_type]["template"])
+        s = self.llm_tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=False, enable_thinking=False
+        )
         full_ids = self.llm_tokenizer(s, return_tensors="pt", add_special_tokens=True)["input_ids"][0].tolist()
         marker_ids = self.llm_tokenizer(marker, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
         pos = _find_subseq(full_ids, marker_ids)

@@ -47,11 +47,13 @@ class HYMotionLoadModel:
     @classmethod
     def INPUT_TYPES(s):
         model_options = ["HY-Motion-1.0", "HY-Motion-1.0-Lite"]
+        quantization_options = ["none", "int8", "int4"]
 
         return {
             "required": {
                 "model_name": (model_options, {"default": "HY-Motion-1.0-Lite"}),
                 "device": (["cuda", "cpu"], {"default": "cuda"}),
+                "quantization": (quantization_options, {"default": "none"}),
             },
         }
 
@@ -60,7 +62,7 @@ class HYMotionLoadModel:
     FUNCTION = "load_model"
     CATEGORY = "HY-Motion"
 
-    def load_model(self, model_name, device):
+    def load_model(self, model_name, device, quantization="none"):
         import yaml
         from .hymotion.utils.loaders import load_object
 
@@ -72,9 +74,14 @@ class HYMotionLoadModel:
             raise FileNotFoundError(f"Config file not found: {config_path}")
 
         print(f"[HY-Motion] Loading model config: {config_path}")
+        print(f"[HY-Motion] Quantization: {quantization}")
 
         with open(config_path, "r") as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
+
+        # Override quantization in text_encoder_cfg
+        if "train_pipeline_args" in config and "text_encoder_cfg" in config["train_pipeline_args"]:
+            config["train_pipeline_args"]["text_encoder_cfg"]["quantization"] = quantization if quantization != "none" else None
 
         pipeline = load_object(
             config["train_pipeline"],
