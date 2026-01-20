@@ -22,6 +22,9 @@ except ImportError:
 
 HYMOTION_MODELS_DIR = os.path.join(COMFY_MODELS_DIR, "HY-Motion")
 
+# Global cache to prevent reloading models on every execution
+_LOADED_MODELS = {}
+
 
 def get_timestamp():
     t = time.time()
@@ -103,11 +106,18 @@ class HYMotionLoadLLM:
     CATEGORY = "HY-Motion/Loaders"
 
     def load_llm(self, quantization="none", offload_to_cpu=False):
-        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-        from .hymotion.network.text_encoders.model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
-
         local_path = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "Qwen3-8B")
         model_path = local_path if os.path.exists(local_path) else "Qwen/Qwen3-8B"
+
+        # Use absolute path for cache key consistentcy
+        abs_model_path = os.path.abspath(model_path) if os.path.exists(local_path) else model_path
+        cache_key = f"llm_{abs_model_path}_{quantization}_{offload_to_cpu}"
+        if cache_key in _LOADED_MODELS:
+            print(f"[HY-Motion] Using cached LLM: {cache_key}")
+            return (_LOADED_MODELS[cache_key],)
+
+        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+        from .hymotion.network.text_encoders.model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
 
         print(f"[HY-Motion] Loading LLM: {model_path}, quantization={quantization}, offload_to_cpu={offload_to_cpu}")
 
@@ -145,6 +155,7 @@ class HYMotionLoadLLM:
 
         wrapper = HYMotionLLMWrapper(model=model, tokenizer=tokenizer, max_length=512, crop_start=crop_start)
         print(f"[HY-Motion] LLM loaded, hidden_size={wrapper.hidden_size}")
+        _LOADED_MODELS[cache_key] = wrapper
         return (wrapper,)
 
     def _compute_crop_start(self, tokenizer, template) -> int:
@@ -205,9 +216,6 @@ class HYMotionLoadLLMGGUF:
     CATEGORY = "HY-Motion/Loaders"
 
     def load_llm_gguf(self, gguf_file, device_strategy="gpu"):
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        from .hymotion.network.text_encoders.model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
-
         # Determine the actual path
         if gguf_file == "(select file)":
             raise ValueError("Please select a GGUF file")
@@ -222,6 +230,16 @@ class HYMotionLoadLLMGGUF:
         gguf_path = os.path.join(gguf_dir, gguf_filename)
         if not os.path.exists(gguf_path):
             raise FileNotFoundError(f"GGUF file not found: {gguf_path}")
+
+        # Use absolute path
+        abs_gguf_path = os.path.abspath(gguf_path)
+        cache_key = f"llm_gguf_{abs_gguf_path}_{device_strategy}"
+        if cache_key in _LOADED_MODELS:
+            print(f"[HY-Motion] Using cached GGUF LLM: {cache_key}")
+            return (_LOADED_MODELS[cache_key],)
+
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from .hymotion.network.text_encoders.model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
 
         print(f"[HY-Motion] Loading LLM from GGUF: {gguf_path}, device_strategy={device_strategy}")
 
@@ -257,6 +275,8 @@ class HYMotionLoadLLMGGUF:
                     # Use auto device map with max_memory constraints to force CPU offloading
                     # This will automatically split layers between GPU and CPU
                     load_kwargs["device_map"] = "auto"
+                    # Use float16 for GPU to save VRAM
+                    load_kwargs["torch_dtype"] = torch.float16
                     # Set max_memory to limit GPU usage - using ~50% will force half to CPU
                     if torch.cuda.is_available():
                         gpu_memory = torch.cuda.get_device_properties(device_index).total_memory
@@ -281,6 +301,8 @@ class HYMotionLoadLLMGGUF:
                     # Map all layers to the GPU device
                     device_index = device.index if device.index is not None else 0
                     load_kwargs["device_map"] = {"": device_index}
+                    # Use float16 for GPU to save VRAM
+                    load_kwargs["torch_dtype"] = torch.float16
                 else:
                     # Fallback to CPU if no GPU available
                     load_kwargs["device_map"] = "cpu"
@@ -310,6 +332,7 @@ class HYMotionLoadLLMGGUF:
             crop_start=crop_start
         )
         print(f"[HY-Motion] GGUF LLM loaded, hidden_size={wrapper.hidden_size}")
+        _LOADED_MODELS[cache_key] = wrapper
         return (wrapper,)
 
     def _compute_crop_start(self, tokenizer, template) -> int:
@@ -352,6 +375,11 @@ class HYMotionLoadNetwork:
     CATEGORY = "HY-Motion/Loaders"
 
     def load_network(self, model_name):
+        cache_key = f"network_{model_name}"
+        if cache_key in _LOADED_MODELS:
+            print(f"[HY-Motion] Using cached Network: {cache_key}")
+            return (_LOADED_MODELS[cache_key],)
+
         import yaml
         from .hymotion.utils.loaders import load_object
         from .hymotion.pipeline.body_model import WoodenMesh
@@ -416,6 +444,7 @@ class HYMotionLoadNetwork:
         wrapper.null_ctxt_input = null_ctxt_input.to(device)
 
         print("[HY-Motion] Network loaded")
+        _LOADED_MODELS[cache_key] = wrapper
         return (wrapper,)
 
 
@@ -447,19 +476,26 @@ class HYMotionLoadPrompter:
     CATEGORY = "HY-Motion/Loaders"
 
     def load_prompter(self, model_source, offload_to_cpu=False):
-        from .hymotion.prompt_engineering.prompt_rewrite import PromptRewriter
-
         if model_source == "local: Text2MotionPrompter":
             model_path = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "Text2MotionPrompter")
         else:
             # Auto download from HuggingFace
             model_path = "Text2MotionPrompter/Text2MotionPrompter"
 
+        cache_key = f"prompter_{model_path}_{offload_to_cpu}"
+        if cache_key in _LOADED_MODELS:
+            print(f"[HY-Motion] Using cached Prompter: {cache_key}")
+            return (_LOADED_MODELS[cache_key],)
+
+        from .hymotion.prompt_engineering.prompt_rewrite import PromptRewriter
+
         print(f"[HY-Motion] Loading Prompter: {model_path}, offload_to_cpu={offload_to_cpu}")
         rewriter = PromptRewriter(model_path=model_path, offload_to_cpu=offload_to_cpu)
         print(f"[HY-Motion] Prompter loaded")
 
-        return (HYMotionPrompterWrapper(rewriter),)
+        wrapper = HYMotionPrompterWrapper(rewriter)
+        _LOADED_MODELS[cache_key] = wrapper
+        return (wrapper,)
 
 
 # ============================================================================
@@ -563,10 +599,18 @@ class HYMotionEncodeText:
             input_ids=llm_enc["input_ids"].to(llm_device),
             attention_mask=llm_enc["attention_mask"].to(llm_device),
             output_hidden_states=True,
+            use_cache=False,
         )
 
         ctxt_raw = llm_out.hidden_states[-1][:, llm.crop_start:llm.crop_start + llm.max_length].contiguous().to(device)
         ctxt_length = (llm_enc["attention_mask"].sum(dim=-1) - llm.crop_start).clamp(0, llm.max_length).to(device)
+
+        # Clear memory
+        del llm_out, llm_enc
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         print(f"[HY-Motion] Encoded: vtxt={vtxt_raw.shape}, ctxt={ctxt_raw.shape}")
         return (HYMotionConditioning(vtxt_raw, ctxt_raw, ctxt_length, text_list),)
@@ -603,6 +647,12 @@ class HYMotionGenerate:
         import comfy.utils
         from torchdiffeq import odeint
         from .hymotion.pipeline.motion_diffusion import length_to_mask, randn_tensor
+        import gc
+
+        # Cleanup before start
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         device = model_management.get_torch_device()
         network.network = network.network.to(device)
@@ -654,6 +704,13 @@ class HYMotionGenerate:
             sampled = odeint(fn, y0, t, method="euler")[-1][:, :length]
 
         output_dict = self._decode(sampled, network)
+        
+        # Cleanup large intermediate tensors
+        del sampled, vtxt_input, ctxt_input, ctxt_length, y0, t
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         print(f"[HY-Motion] Done")
         return (HYMotionData(output_dict, conditioning.text[0], duration, seeds),)
 
@@ -688,20 +745,29 @@ class HYMotionGenerate:
             rot6d_cpu = rot6d_s.cpu()
             transl_cpu = transl_s.cpu()
             k3d_list = []
-            vertices_list = []
+            
+            # Process batch items individually to save memory
             with torch.no_grad():
                 for b in range(B):
+                    # Forward pass for single batch item
                     out = net.body_model.forward({"rot6d": rot6d_cpu[b], "trans": transl_cpu[b]})
-                    k3d_list.append(out["keypoints3d"])
-                    vertices_list.append(out["vertices"])
+                    
+                    k3d_b = out["keypoints3d"] # (L, J, 3)
+                    vertices_b = out["vertices"] # (L, V, 3)
+                    
+                    # Align to ground: find min y across all frames and vertices for this sequence
+                    min_y = vertices_b[..., 1].min()
+                    
+                    # Apply offset
+                    k3d_b[..., 1] -= min_y
+                    transl_cpu[b, ..., 1] -= min_y
+                    
+                    k3d_list.append(k3d_b)
+                    
+                    # Explicitly delete large vertex tensor
+                    del vertices_b
+                    
             k3d = torch.stack(k3d_list, dim=0)
-            vertices = torch.stack(vertices_list, dim=0)
-            # Align to ground
-            min_y = vertices[..., 1].amin(dim=(1, 2), keepdim=True)
-            k3d = k3d.clone()
-            k3d[..., 1] -= min_y
-            transl_cpu = transl_cpu.clone()
-            transl_cpu[..., 1] -= min_y.squeeze(-1)
             transl_s = transl_cpu
         else:
             k3d = torch.zeros(B, L, 22, 3)
