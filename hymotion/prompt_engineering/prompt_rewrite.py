@@ -271,7 +271,7 @@ class PromptRewriter:
     def _load_model(self):
         if self.model is None:
             print(f">>> Loading prompter model from {self.model_path}, offload_to_cpu={self.offload_to_cpu}")
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, local_files_only=True)
 
             if self.offload_to_cpu:
                 # Load entirely on CPU (slower but saves GPU memory)
@@ -281,6 +281,7 @@ class PromptRewriter:
                     torch_dtype=torch.float32,
                     device_map="cpu",
                     low_cpu_mem_usage=True,
+                    local_files_only=True
                 )
             else:
                 # Load on GPU with 4bit quantization
@@ -296,6 +297,7 @@ class PromptRewriter:
                     quantization_config=quantization_config,
                     device_map="auto",
                     low_cpu_mem_usage=True,
+                    local_files_only=True
                 )
 
             self.model.eval()

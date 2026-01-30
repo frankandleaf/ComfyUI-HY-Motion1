@@ -3,6 +3,7 @@ import sys
 import uuid
 import time
 import numpy as np
+import model_management
 import torch
 from typing import Optional, List, Dict, Any
 
@@ -21,9 +22,6 @@ except ImportError:
     COMFY_OUTPUT_DIR = os.path.join(os.path.dirname(CURRENT_DIR), "output")
 
 HYMOTION_MODELS_DIR = os.path.join(COMFY_MODELS_DIR, "HY-Motion")
-
-# Global cache to prevent reloading models on every execution
-_LOADED_MODELS = {}
 
 
 def get_timestamp():
@@ -93,9 +91,39 @@ class HYMotionLoadLLM:
     """Load Qwen3 LLM with quantization support"""
     @classmethod
     def INPUT_TYPES(s):
+        # Scan for available Qwen3 models
+        qwen_models = []
+        qwen_dir = os.path.join(HYMOTION_MODELS_DIR, "ckpts")
+        if os.path.exists(qwen_dir):
+            for f in os.listdir(qwen_dir):
+                full_path = os.path.join(qwen_dir, f)
+                if os.path.isdir(full_path) and ("qwen3" in f.lower() or "qwen-3" in f.lower()):
+                    qwen_models.append(f)
+                # Also include bnb-4bit and awq models
+                elif os.path.isdir(full_path) and ("bnb-4bit" in f.lower() or "awq" in f.lower()):
+                    qwen_models.append(f)
+        
+        # Add support for specific models
+        # Check for Qwen3-8B-bnb-4bit
+        bnb_model_path = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "Qwen3-8B-bnb-4bit")
+        if os.path.exists(bnb_model_path):
+            if "Qwen3-8B-bnb-4bit" not in qwen_models:
+                qwen_models.append("Qwen3-8B-bnb-4bit")
+        
+        # Check for Qwen3-8B-AWQ
+        awq_model_path = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "Qwen3-8B-AWQ")
+        if os.path.exists(awq_model_path):
+            if "Qwen3-8B-AWQ" not in qwen_models:
+                qwen_models.append("Qwen3-8B-AWQ")
+        
+        # Default to Qwen3-8B if no models found
+        if not qwen_models:
+            qwen_models = ["Qwen3-8B"]
+        
         return {
             "required": {
-                "quantization": (["none", "int8", "int4"], {"default": "none"}),
+                "model_name": (qwen_models, {"default": qwen_models[0]}),
+                "quantization": (["none", "int8", "int4", "bnb-4bit", "awq"], {"default": "none"}),
                 "offload_to_cpu": ("BOOLEAN", {"default": False}),
             },
         }
@@ -105,23 +133,17 @@ class HYMotionLoadLLM:
     FUNCTION = "load_llm"
     CATEGORY = "HY-Motion/Loaders"
 
-    def load_llm(self, quantization="none", offload_to_cpu=False):
-        local_path = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "Qwen3-8B")
-        model_path = local_path if os.path.exists(local_path) else "Qwen/Qwen3-8B"
-
-        # Use absolute path for cache key consistentcy
-        abs_model_path = os.path.abspath(model_path) if os.path.exists(local_path) else model_path
-        cache_key = f"llm_{abs_model_path}_{quantization}_{offload_to_cpu}"
-        if cache_key in _LOADED_MODELS:
-            print(f"[HY-Motion] Using cached LLM: {cache_key}")
-            return (_LOADED_MODELS[cache_key],)
-
+    def load_llm(self, model_name="Qwen3-8B", quantization="none", offload_to_cpu=False):
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
         from .hymotion.network.text_encoders.model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
 
-        print(f"[HY-Motion] Loading LLM: {model_path}, quantization={quantization}, offload_to_cpu={offload_to_cpu}")
+        local_path = os.path.join(HYMOTION_MODELS_DIR, "ckpts", model_name)
+        if not os.path.exists(local_path):
+            raise FileNotFoundError(f"LLM directory not found: {local_path}. Please download the {model_name} model first and place it in the HY-Motion models directory.")
 
-        load_kwargs = {"low_cpu_mem_usage": True}
+        print(f"[HY-Motion] Loading LLM: {local_path}, quantization={quantization}, offload_to_cpu={offload_to_cpu}")
+
+        load_kwargs = {"low_cpu_mem_usage": True, "local_files_only": True}
 
         if offload_to_cpu:
             load_kwargs["device_map"] = "cpu"
@@ -137,9 +159,44 @@ class HYMotionLoadLLM:
                 bnb_4bit_quant_type="nf4",
             )
             load_kwargs["device_map"] = "auto"
+        elif quantization == "bnb-4bit":
+            # For bnb-4bit models
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+            load_kwargs["device_map"] = "auto"
+        elif quantization == "awq":
+            # For AWQ models
+            try:
+                from awq import AutoAWQForCausalLM
+                print("[HY-Motion] Using AWQ for model loading")
+                tokenizer = AutoTokenizer.from_pretrained(local_path, padding_side="right", local_files_only=True)
+                model = AutoAWQForCausalLM.from_pretrained(local_path, **load_kwargs)
+                model = model.eval().requires_grad_(False)
+                
+                # Compute crop_start
+                template = [
+                    {"role": "system", "content": f"{PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION}"},
+                    {"role": "user", "content": "{}"},
+                ]
+                crop_start = self._compute_crop_start(tokenizer, template)
 
-        tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
-        model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+                if not offload_to_cpu and quantization == "none":
+                    device = model_management.get_torch_device()
+                    model = model.to(device)
+
+                wrapper = HYMotionLLMWrapper(model=model, tokenizer=tokenizer, max_length=512, crop_start=crop_start)
+                print(f"[HY-Motion] LLM loaded, hidden_size={wrapper.hidden_size}")
+                return (wrapper,)
+            except ImportError:
+                print("[HY-Motion] AWQ not installed, falling back to regular loading")
+                load_kwargs["device_map"] = "auto"
+
+        tokenizer = AutoTokenizer.from_pretrained(local_path, padding_side="right", local_files_only=True)
+        model = AutoModelForCausalLM.from_pretrained(local_path, **load_kwargs)
         model = model.eval().requires_grad_(False)
 
         # Compute crop_start
@@ -155,7 +212,6 @@ class HYMotionLoadLLM:
 
         wrapper = HYMotionLLMWrapper(model=model, tokenizer=tokenizer, max_length=512, crop_start=crop_start)
         print(f"[HY-Motion] LLM loaded, hidden_size={wrapper.hidden_size}")
-        _LOADED_MODELS[cache_key] = wrapper
         return (wrapper,)
 
     def _compute_crop_start(self, tokenizer, template) -> int:
@@ -200,7 +256,7 @@ class HYMotionLoadLLMGGUF:
         llm_gguf_dir = os.path.join(COMFY_MODELS_DIR, "llm", "GGUF")
         if os.path.exists(llm_gguf_dir):
             for f in os.listdir(llm_gguf_dir):
-                if f.endswith(".gguf") and "qwen" in f.lower():
+                if f.endswith(".gguf"):
                     gguf_files.append(f"llm/GGUF/{f}")
 
         return {
@@ -216,6 +272,34 @@ class HYMotionLoadLLMGGUF:
     CATEGORY = "HY-Motion/Loaders"
 
     def load_llm_gguf(self, gguf_file, device_strategy="gpu"):
+        # 首先进行紧急内存清理
+        print("[HY-Motion] Emergency memory cleanup before loading...")
+        import gc
+        for _ in range(10):
+            gc.collect()
+        
+        try:
+            import torch
+            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.ipc_collect()
+        except:
+            pass
+        
+        # 检查内存状态
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            print(f"[HY-Motion] Initial memory status: {mem.available / (1024**3):.1f}GB available out of {mem.total / (1024**3):.1f}GB")
+        except:
+            pass
+        
+        # 延迟导入，减少内存使用
+        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+        from transformers.utils.hub import cached_file
+        from .hymotion.network.text_encoders.model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
+        
+        # -------------------------- Memory optimization --------------------------
         # Determine the actual path
         if gguf_file == "(select file)":
             raise ValueError("Please select a GGUF file")
@@ -227,22 +311,84 @@ class HYMotionLoadLLMGGUF:
             gguf_dir = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "GGUF")
             gguf_filename = gguf_file
 
+        os.makedirs(gguf_dir, exist_ok=True)
         gguf_path = os.path.join(gguf_dir, gguf_filename)
+
         if not os.path.exists(gguf_path):
-            raise FileNotFoundError(f"GGUF file not found: {gguf_path}")
-
-        # Use absolute path
-        abs_gguf_path = os.path.abspath(gguf_path)
-        cache_key = f"llm_gguf_{abs_gguf_path}_{device_strategy}"
-        if cache_key in _LOADED_MODELS:
-            print(f"[HY-Motion] Using cached GGUF LLM: {cache_key}")
-            return (_LOADED_MODELS[cache_key],)
-
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        from .hymotion.network.text_encoders.model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
+            raise FileNotFoundError(f"GGUF file not found: {gguf_path}\nPlease place your GGUF file in {gguf_dir}")
 
         print(f"[HY-Motion] Loading LLM from GGUF: {gguf_path}, device_strategy={device_strategy}")
-
+        tokenizer = None
+        tokenizer_loaded = False
+        
+        # 尝试1: 从GGUF文件所在目录加载tokenizer
+        try:
+            # 再次清理内存
+            gc.collect()
+            print("[HY-Motion] Loading tokenizer from GGUF directory...")
+            tokenizer = AutoTokenizer.from_pretrained(
+                gguf_dir,
+                padding_side="right",
+                local_files_only=True
+            )
+            tokenizer_loaded = True
+            print(f"[HY-Motion] Tokenizer loaded from GGUF directory: {gguf_dir}")
+        except Exception as e:
+            print(f"[HY-Motion] Failed to load tokenizer from GGUF directory: {e}")
+        
+        # 尝试2: 从所有可用的Qwen3目录加载tokenizer
+        if not tokenizer_loaded:
+            qwen_dir = os.path.join(HYMOTION_MODELS_DIR, "ckpts")
+            if os.path.exists(qwen_dir):
+                for f in os.listdir(qwen_dir):
+                    if tokenizer_loaded:
+                        break
+                    
+                    full_path = os.path.join(qwen_dir, f)
+                    if os.path.isdir(full_path) and ("qwen3" in f.lower() or "qwen-3" in f.lower()):
+                        try:
+                            # 再次清理内存
+                            gc.collect()
+                            print(f"[HY-Motion] Loading tokenizer from: {full_path}...")
+                            tokenizer = AutoTokenizer.from_pretrained(
+                                full_path,
+                                padding_side="right",
+                                local_files_only=True
+                            )
+                            tokenizer_loaded = True
+                            print(f"[HY-Motion] Tokenizer loaded from: {full_path}")
+                        except Exception as e:
+                            print(f"[HY-Motion] Failed to load tokenizer from {full_path}: {e}")
+        
+        # 尝试3: 从默认的Qwen3-8B目录加载tokenizer
+        if not tokenizer_loaded:
+            default_tokenizer_path = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "Qwen3-8B")
+            if os.path.exists(default_tokenizer_path):
+                try:
+                    # 再次清理内存
+                    gc.collect()
+                    print(f"[HY-Motion] Loading tokenizer from default path: {default_tokenizer_path}...")
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        default_tokenizer_path,
+                        padding_side="right",
+                        local_files_only=True
+                    )
+                    tokenizer_loaded = True
+                    print(f"[HY-Motion] Tokenizer loaded from default path: {default_tokenizer_path}")
+                except Exception as e:
+                    print(f"[HY-Motion] Failed to load tokenizer from default path: {e}")
+        
+        # 清理内存
+        gc.collect()
+        
+        # 如果所有尝试都失败，抛出错误
+        if not tokenizer_loaded:
+            raise FileNotFoundError(
+                f"Tokenizer not found. Please ensure you have a valid Qwen3 tokenizer in any of the following locations:"
+                f"1. {gguf_dir}\n"
+                f"2. {os.path.join(HYMOTION_MODELS_DIR, 'ckpts')} (any Qwen3 directory)\n"
+                f"3. {os.path.join(HYMOTION_MODELS_DIR, 'ckpts', 'Qwen3-8B')} (default)"
+            )
         # Check transformers version for native GGUF support
         try:
             import transformers
@@ -252,64 +398,423 @@ class HYMotionLoadLLMGGUF:
             has_native_gguf = False
 
         if has_native_gguf:
-            tokenizer_path = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "Qwen3-8B")
-            if not os.path.exists(tokenizer_path):
-                tokenizer_path = "Qwen/Qwen3-8B"
+            # Tokenizer已经在前面加载过，这里跳过重复加载
+            print("[HY-Motion] Using previously loaded tokenizer")
 
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, padding_side="right")
-
+            # -------------------------- GGUF内存优化参数 --------------------------
             load_kwargs = {
                 "gguf_file": gguf_filename,
                 "low_cpu_mem_usage": True,
+                "dtype": torch.float16,  # 使用新的dtype参数替代已弃用的torch_dtype
+                "local_files_only": True,
+                "max_memory": None,  # 初始化为None，后面根据设备策略设置
+                "device_map": None,  # 初始化为None，后面根据设备策略设置
+                # GGUF特定优化
+                "quantization_config": None,  # GGUF文件已包含量化信息，无需额外配置
+                "trust_remote_code": False,  # GGUF模型不需要远程代码
+                # 增强内存优化
+                "use_safetensors": False,  # GGUF不需要safetensors
+                "attn_implementation": "eager",  # 使用内存效率更高的attention实现
+                "use_cache": False,  # 禁用缓存以减少内存使用
+                "force_download": False,
+                "resume_download": False
             }
             
             device = model_management.get_torch_device()
             
+            # -------------------------- 执行前内存清理 --------------------------
+            # 加载前先深度清理内存，防止内存碎片化
+            print("[HY-Motion] Performing aggressive memory cleanup...")
+            
+            # 清理PyTorch内存
+            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.ipc_collect()
+            
+            # 清理Python内存
+            import gc
+            for _ in range(5):
+                gc.collect()
+            
+            # 清理可能的缓存
+            if 'torch' in sys.modules:
+                try:
+                    torch.cuda.empty_cache()
+                except:
+                    pass
+            
+            # 检查当前内存状态
+            try:
+                import psutil
+                mem = psutil.virtual_memory()
+                print(f"[HY-Motion] Memory status after cleanup: {mem.available / (1024**3):.1f}GB available out of {mem.total / (1024**3):.1f}GB")
+                
+                if mem.available < 2 * 1024**3:  # 少于2GB可用内存
+                    print("[HY-Motion] WARNING: Very low memory available!")
+                    print("[HY-Motion] Attempting emergency memory cleanup...")
+                    
+                    # 尝试释放更多内存
+                    for _ in range(10):
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        if torch.cuda.is_available():
+                            torch.cuda.ipc_collect()
+                    
+                    mem = psutil.virtual_memory()
+                    print(f"[HY-Motion] Memory status after emergency cleanup: {mem.available / (1024**3):.1f}GB available")
+            except:
+                pass
+            
+            print("[HY-Motion] Memory cleanup completed")
+            
             if device_strategy == "cpu":
+                # CPU模式：完全在CPU上加载，不使用GPU内存
                 load_kwargs["device_map"] = "cpu"
-                load_kwargs["torch_dtype"] = torch.float32
+                load_kwargs["dtype"] = torch.float16  # 使用dtype替代torch_dtype
+                print("[HY-Motion] CPU mode: Loading model entirely on CPU to save GPU memory")
             elif device_strategy == "balanced":
-                # Balanced: split between CPU and GPU (approximately half on each)
+                # 平衡模式：合理使用GPU内存
                 if device.type == "cuda":
                     device_index = device.index if device.index is not None else 0
-                    # Use auto device map with max_memory constraints to force CPU offloading
-                    # This will automatically split layers between GPU and CPU
-                    load_kwargs["device_map"] = "auto"
-                    # Use float16 for GPU to save VRAM
-                    load_kwargs["torch_dtype"] = torch.float16
-                    # Set max_memory to limit GPU usage - using ~50% will force half to CPU
+                    load_kwargs["device_map"] = device_index
+                    
                     if torch.cuda.is_available():
                         gpu_memory = torch.cuda.get_device_properties(device_index).total_memory
-                        # Limit GPU to approximately 50% of available memory to force CPU offloading
-                        # Convert bytes to GiB for max_memory (1 GiB = 1024^3 bytes)
-                        gpu_limit_gib = max(1, int((gpu_memory * 0.5) / (1024**3)))  # At least 1 GiB
-                        # Set high CPU memory limit to avoid disk offloading
-                        load_kwargs["max_memory"] = {device_index: f"{gpu_limit_gib}GiB", "cpu": "100GiB"}
-                        # Create a temporary offload folder as fallback (required if disk offloading occurs)
-                        import tempfile
-                        offload_folder = tempfile.mkdtemp(prefix="hymotion_offload_")
-                        load_kwargs["offload_folder"] = offload_folder
-                        print(f"[HY-Motion] Balanced mode: limiting GPU {device_index} to {gpu_limit_gib}GiB, rest on CPU")
-                        print(f"[HY-Motion] Offload folder (fallback): {offload_folder}")
+                        # 合理使用GPU内存（70%），为其他操作留适当空间
+                        gpu_limit_gib = max(1, int((gpu_memory * 0.7) / (1024**3)))
+                        # 限制CPU内存使用
+                        cpu_limit_gib = 8  # 最多使用8GB CPU内存
+                        load_kwargs["max_memory"] = {
+                            device_index: f"{gpu_limit_gib}GiB", 
+                            "cpu": f"{cpu_limit_gib}GiB"  # 限制CPU内存使用
+                        }
+                        print(f"[HY-Motion] Balanced mode: using up to {gpu_limit_gib}GiB of GPU memory and {cpu_limit_gib}GiB of CPU memory")
+                        print("[HY-Motion] Using forced GPU device mapping for better memory management")
                 else:
-                    # No GPU available, fallback to CPU
                     load_kwargs["device_map"] = "cpu"
-                    load_kwargs["torch_dtype"] = torch.float32
+                    load_kwargs["dtype"] = torch.float16  # 使用dtype替代torch_dtype
             else:  # device_strategy == "gpu"
-                # Use explicit GPU device map to avoid disk offloading
+                # GPU模式：优先使用GPU，积极使用GPU内存
                 if device.type == "cuda":
-                    # Map all layers to the GPU device
                     device_index = device.index if device.index is not None else 0
-                    load_kwargs["device_map"] = {"": device_index}
-                    # Use float16 for GPU to save VRAM
-                    load_kwargs["torch_dtype"] = torch.float16
+                    # 强制使用特定GPU设备
+                    load_kwargs["device_map"] = device_index
+                    
+                    if torch.cuda.is_available():
+                        gpu_memory = torch.cuda.get_device_properties(device_index).total_memory
+                        # 积极使用GPU内存（90%），充分利用GPU资源
+                        gpu_limit_gib = max(1, int((gpu_memory * 0.9) / (1024**3)))
+                        # 严格限制CPU内存使用
+                        cpu_limit_gib = 6  # 最多使用6GB CPU内存
+                        load_kwargs["max_memory"] = {
+                            device_index: f"{gpu_limit_gib}GiB", 
+                            "cpu": f"{cpu_limit_gib}GiB"  # 严格限制CPU内存使用
+                        }
+                        print(f"[HY-Motion] GPU mode: using up to {gpu_limit_gib}GiB of GPU memory and {cpu_limit_gib}GiB of CPU memory")
+                        print("[HY-Motion] Forcing GPU device mapping to reduce CPU memory usage")
                 else:
-                    # Fallback to CPU if no GPU available
                     load_kwargs["device_map"] = "cpu"
-                    load_kwargs["torch_dtype"] = torch.float32
-
-            model = AutoModelForCausalLM.from_pretrained(gguf_dir, **load_kwargs)
-            model = model.eval().requires_grad_(False)
+                    load_kwargs["dtype"] = torch.float16  # 使用dtype替代torch_dtype
+            
+            # 添加额外的内存优化选项
+            load_kwargs["use_cache"] = False  # 禁用模型缓存，减少内存使用
+            
+            # 移除不兼容的参数
+            incompatible_params = ['use_flash_attention_2', 'rope_scaling', 'rope_theta']
+            for param in incompatible_params:
+                if param in load_kwargs:
+                    del load_kwargs[param]
+                    print(f"[HY-Motion] Removed incompatible parameter: {param}")
+            
+            # 禁用attn_implementation以减少内存使用和兼容性问题
+            # 仅在模型加载成功后考虑启用
+            
+            # -------------------------- 尝试加载模型，带内存错误回退 --------------------------
+            try:
+                # 加载前深度清理内存
+                print("[HY-Motion] Performing deep memory cleanup before model loading...")
+                
+                # 清理PyTorch内存
+                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.ipc_collect()
+                
+                # 清理Python内存
+                import gc
+                gc.collect()
+                
+                # 强制垃圾回收
+                for _ in range(3):
+                    gc.collect()
+                
+                # 清理numpy内存
+                if 'numpy' in sys.modules:
+                    import numpy as np
+                    # 尝试释放numpy缓存
+                    if hasattr(np, 'ndarray'):
+                        print("[HY-Motion] Numpy available, memory cleanup complete")
+                
+                # 加载模型
+                print(f"[HY-Motion] Attempting to load model with kwargs: {load_kwargs.keys()}")
+                model = AutoModelForCausalLM.from_pretrained(gguf_dir, **load_kwargs)
+                model = model.eval().requires_grad_(False)
+                
+                # 立即清理临时变量和内存
+                del load_kwargs  # 释放load_kwargs占用的内存
+                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.ipc_collect()
+                gc.collect()
+                
+                print("[HY-Motion] Model loaded successfully")
+                
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() or "memory" in str(e).lower():
+                    # 内存不足，尝试回退到CPU模式
+                    print(f"[HY-Motion] GPU memory error: {e}")
+                    print("[HY-Motion] Falling back to CPU mode...")
+                    
+                    # 深度清理内存
+                    torch.cuda.empty_cache()
+                    if torch.cuda.is_available():
+                        torch.cuda.ipc_collect()
+                    import gc
+                    gc.collect()
+                    
+                    # 使用更保守的CPU模式参数重新加载
+                    # 获取系统内存信息
+                    try:
+                        import psutil
+                        total_system_memory = psutil.virtual_memory().total
+                        
+                        # 系统内存充足（32G+），可以使用更多CPU内存
+                        cpu_memory_limit = min(int(total_system_memory * 0.4 / (1024**3)), 16)  # 最多使用16GB CPU内存
+                        
+                        print(f"[HY-Motion] System memory: {total_system_memory / (1024**3):.1f}GB total")
+                        print(f"[HY-Motion] Setting CPU memory limit: {cpu_memory_limit}GiB")
+                    except ImportError:
+                        # psutil不可用，使用默认值
+                        print("[HY-Motion] psutil not available, using default CPU memory limit")
+                        cpu_memory_limit = 12  # 默认使用12GB CPU内存
+                        print(f"[HY-Motion] Setting default CPU memory limit: {cpu_memory_limit}GiB")
+                    
+                    cpu_load_kwargs = {
+                        "gguf_file": gguf_filename,
+                        "low_cpu_mem_usage": True,
+                        "dtype": torch.float16,
+                        "local_files_only": True,
+                        "device_map": "cpu",
+                        "quantization_config": None,
+                        "trust_remote_code": False,
+                        "use_safetensors": False,
+                        "attn_implementation": "eager",
+                        "max_memory": {"cpu": f"{cpu_memory_limit}GiB"}  # 根据系统内存调整CPU内存限制
+                    }
+                    
+                    # 移除不兼容的参数
+                    incompatible_params = ['use_flash_attention_2', 'rope_scaling', 'rope_theta']
+                    for param in incompatible_params:
+                        if param in cpu_load_kwargs:
+                            del cpu_load_kwargs[param]
+                            print(f"[HY-Motion] Removed incompatible parameter from CPU fallback: {param}")
+                    
+                    model = AutoModelForCausalLM.from_pretrained(gguf_dir, **cpu_load_kwargs)
+                    model = model.eval().requires_grad_(False)
+                    
+                    # 清理临时变量
+                    del cpu_load_kwargs
+                    gc.collect()
+                    
+                    print("[HY-Motion] Model loaded successfully in CPU fallback mode")
+                else:
+                    # 其他错误，重新抛出
+                    raise
+            except np._core._exceptions._ArrayMemoryError as e:
+                # 捕获numpy内存分配错误
+                print(f"[HY-Motion] Numpy memory allocation error: {e}")
+                print("[HY-Motion] Falling back to optimized GPU mode...")
+                
+                # 深度清理内存
+                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.ipc_collect()
+                import gc
+                gc.collect()
+                
+                # 尝试使用优化的GPU模式
+                if device_strategy == "gpu" and torch.cuda.is_available():
+                    print("[HY-Motion] Attempting optimized GPU loading...")
+                    # 获取系统内存信息
+                    try:
+                        import psutil
+                        total_system_memory = psutil.virtual_memory().total
+                        available_system_memory = psutil.virtual_memory().available
+                        
+                        # 计算合理的内存限制
+                        # 强制使用更多GPU内存，减少CPU内存使用
+                        cpu_memory_limit = min(int(total_system_memory * 0.2 / (1024**3)), 8)  # 最多使用8GB CPU内存
+                        gpu_memory_limit = int(torch.cuda.get_device_properties(device.index).total_memory * 0.9 / (1024**3))  # 使用90% GPU内存
+                        
+                        print(f"[HY-Motion] System memory: {total_system_memory / (1024**3):.1f}GB total, {available_system_memory / (1024**3):.1f}GB available")
+                        print(f"[HY-Motion] Setting memory limits: GPU={gpu_memory_limit}GiB, CPU={cpu_memory_limit}GiB")
+                    except ImportError:
+                        # psutil不可用，使用默认值
+                        print("[HY-Motion] psutil not available, using default memory limits")
+                        cpu_memory_limit = 6  # 默认使用6GB CPU内存
+                        gpu_memory_limit = int(torch.cuda.get_device_properties(device.index).total_memory * 0.9 / (1024**3))  # 使用90% GPU内存
+                        print(f"[HY-Motion] Setting default memory limits: GPU={gpu_memory_limit}GiB, CPU={cpu_memory_limit}GiB")
+                    
+                    # 强制GPU模式：使用更积极的设备映射策略
+                    optimized_load_kwargs = {
+                        "gguf_file": gguf_filename,
+                        "low_cpu_mem_usage": True,
+                        "dtype": torch.float16,
+                        "local_files_only": True,
+                        "device_map": device.index,  # 强制使用特定GPU设备
+                        "quantization_config": None,
+                        "trust_remote_code": False,
+                        "use_safetensors": False,
+                        "attn_implementation": "eager",
+                        "max_memory": {
+                            device.index: f"{gpu_memory_limit}GiB",
+                            "cpu": f"{cpu_memory_limit}GiB"  # 严格限制CPU内存使用
+                        },
+                        "use_cache": False,
+                        "force_download": False,
+                        "resume_download": False
+                    }
+                    
+                    # 打印详细信息
+                    print("[HY-Motion] Forcing GPU device mapping and reducing CPU memory usage")
+                    print("[HY-Motion] This will attempt to perform more operations directly on GPU")
+                    
+                    # 移除不兼容的参数
+                    incompatible_params = ['use_flash_attention_2', 'rope_scaling', 'rope_theta']
+                    for param in incompatible_params:
+                        if param in optimized_load_kwargs:
+                            del optimized_load_kwargs[param]
+                            print(f"[HY-Motion] Removed incompatible parameter from optimized GPU fallback: {param}")
+                    
+                    try:
+                        model = AutoModelForCausalLM.from_pretrained(gguf_dir, **optimized_load_kwargs)
+                        model = model.eval().requires_grad_(False)
+                        del optimized_load_kwargs
+                        gc.collect()
+                        print("[HY-Motion] Model loaded successfully in optimized GPU mode")
+                    except Exception as gpu_e:
+                        print(f"[HY-Motion] Optimized GPU mode failed: {gpu_e}")
+                        print("[HY-Motion] Falling back to minimal memory mode...")
+                        
+                        # 使用最小内存模式参数
+                        # 获取系统内存信息
+                        try:
+                            import psutil
+                            total_system_memory = psutil.virtual_memory().total
+                            
+                            # 系统内存充足（32G+），可以使用更多CPU内存
+                            cpu_memory_limit = min(int(total_system_memory * 0.3 / (1024**3)), 12)  # 最多使用12GB CPU内存
+                            
+                            print(f"[HY-Motion] System memory: {total_system_memory / (1024**3):.1f}GB total")
+                            print(f"[HY-Motion] Setting minimal CPU memory limit: {cpu_memory_limit}GiB")
+                        except ImportError:
+                            # psutil不可用，使用默认值
+                            print("[HY-Motion] psutil not available, using default minimal CPU memory limit")
+                            cpu_memory_limit = 8  # 默认使用8GB CPU内存
+                            print(f"[HY-Motion] Setting default minimal CPU memory limit: {cpu_memory_limit}GiB")
+                        
+                        minimal_load_kwargs = {
+                            "gguf_file": gguf_filename,
+                            "low_cpu_mem_usage": True,
+                            "dtype": torch.float16,
+                            "local_files_only": True,
+                            "device_map": "cpu",
+                            "quantization_config": None,
+                            "trust_remote_code": False,
+                            "use_safetensors": False,
+                            "attn_implementation": "eager",
+                            "max_memory": {"cpu": f"{cpu_memory_limit}GiB"},  # 根据系统内存调整CPU内存限制
+                            "use_cache": False  # 确保禁用缓存
+                        }
+                        
+                        # 移除不兼容的参数
+                        for param in incompatible_params:
+                            if param in minimal_load_kwargs:
+                                del minimal_load_kwargs[param]
+                                print(f"[HY-Motion] Removed incompatible parameter from minimal fallback: {param}")
+                        
+                        model = AutoModelForCausalLM.from_pretrained(gguf_dir, **minimal_load_kwargs)
+                        model = model.eval().requires_grad_(False)
+                        
+                        # 清理临时变量
+                        del minimal_load_kwargs
+                        gc.collect()
+                        
+                        print("[HY-Motion] Model loaded successfully in minimal memory mode")
+                else:
+                    # 使用最小内存模式参数
+                    # 获取系统内存信息
+                    try:
+                        import psutil
+                        total_system_memory = psutil.virtual_memory().total
+                        
+                        # 系统内存充足（32G+），可以使用更多CPU内存
+                        cpu_memory_limit = min(int(total_system_memory * 0.3 / (1024**3)), 12)  # 最多使用12GB CPU内存
+                        
+                        print(f"[HY-Motion] System memory: {total_system_memory / (1024**3):.1f}GB total")
+                        print(f"[HY-Motion] Setting minimal CPU memory limit: {cpu_memory_limit}GiB")
+                    except ImportError:
+                        # psutil不可用，使用默认值
+                        print("[HY-Motion] psutil not available, using default minimal CPU memory limit")
+                        cpu_memory_limit = 8  # 默认使用8GB CPU内存
+                        print(f"[HY-Motion] Setting default minimal CPU memory limit: {cpu_memory_limit}GiB")
+                    
+                    minimal_load_kwargs = {
+                        "gguf_file": gguf_filename,
+                        "low_cpu_mem_usage": True,
+                        "dtype": torch.float16,
+                        "local_files_only": True,
+                        "device_map": "cpu",
+                        "quantization_config": None,
+                        "trust_remote_code": False,
+                        "use_safetensors": False,
+                        "attn_implementation": "eager",
+                        "max_memory": {"cpu": f"{cpu_memory_limit}GiB"},  # 根据系统内存调整CPU内存限制
+                        "use_cache": False  # 确保禁用缓存
+                    }
+                    
+                    # 移除不兼容的参数
+                    incompatible_params = ['use_flash_attention_2', 'rope_scaling', 'rope_theta']
+                    for param in incompatible_params:
+                        if param in minimal_load_kwargs:
+                            del minimal_load_kwargs[param]
+                            print(f"[HY-Motion] Removed incompatible parameter from minimal fallback: {param}")
+                    
+                    model = AutoModelForCausalLM.from_pretrained(gguf_dir, **minimal_load_kwargs)
+                    model = model.eval().requires_grad_(False)
+                    
+                    # 清理临时变量
+                    del minimal_load_kwargs
+                    gc.collect()
+                    
+                    print("[HY-Motion] Model loaded successfully in minimal memory mode")
+            except Exception as e:
+                # 捕获其他可能的错误
+                print(f"[HY-Motion] Unexpected error loading model: {e}")
+                raise
+            
+            # -------------------------- 内存清理 --------------------------
+            # 强制释放未使用的GPU内存
+            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.ipc_collect()
+                
+            # 显式删除加载过程中可能产生的临时变量
+            import gc
+            gc.collect()
+            
+            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.ipc_collect()
         else:
             print("[HY-Motion] transformers<4.40, GGUF not supported")
             raise NotImplementedError(
@@ -331,8 +836,13 @@ class HYMotionLoadLLMGGUF:
             max_length=512,
             crop_start=crop_start
         )
+        
+        # 再次清理内存
+        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.ipc_collect()
+            
         print(f"[HY-Motion] GGUF LLM loaded, hidden_size={wrapper.hidden_size}")
-        _LOADED_MODELS[cache_key] = wrapper
         return (wrapper,)
 
     def _compute_crop_start(self, tokenizer, template) -> int:
@@ -375,11 +885,6 @@ class HYMotionLoadNetwork:
     CATEGORY = "HY-Motion/Loaders"
 
     def load_network(self, model_name):
-        cache_key = f"network_{model_name}"
-        if cache_key in _LOADED_MODELS:
-            print(f"[HY-Motion] Using cached Network: {cache_key}")
-            return (_LOADED_MODELS[cache_key],)
-
         import yaml
         from .hymotion.utils.loaders import load_object
         from .hymotion.pipeline.body_model import WoodenMesh
@@ -444,7 +949,6 @@ class HYMotionLoadNetwork:
         wrapper.null_ctxt_input = null_ctxt_input.to(device)
 
         print("[HY-Motion] Network loaded")
-        _LOADED_MODELS[cache_key] = wrapper
         return (wrapper,)
 
 
@@ -476,26 +980,21 @@ class HYMotionLoadPrompter:
     CATEGORY = "HY-Motion/Loaders"
 
     def load_prompter(self, model_source, offload_to_cpu=False):
+        from .hymotion.prompt_engineering.prompt_rewrite import PromptRewriter
+
         if model_source == "local: Text2MotionPrompter":
             model_path = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "Text2MotionPrompter")
+            if not os.path.exists(model_path):
+                raise FileNotFoundError(f"Prompter model directory not found: {model_path}. Please download the Text2MotionPrompter model first and place it in the HY-Motion models directory.")
         else:
-            # Auto download from HuggingFace
+            # Auto download from HuggingFace - not recommended for offline use
             model_path = "Text2MotionPrompter/Text2MotionPrompter"
-
-        cache_key = f"prompter_{model_path}_{offload_to_cpu}"
-        if cache_key in _LOADED_MODELS:
-            print(f"[HY-Motion] Using cached Prompter: {cache_key}")
-            return (_LOADED_MODELS[cache_key],)
-
-        from .hymotion.prompt_engineering.prompt_rewrite import PromptRewriter
 
         print(f"[HY-Motion] Loading Prompter: {model_path}, offload_to_cpu={offload_to_cpu}")
         rewriter = PromptRewriter(model_path=model_path, offload_to_cpu=offload_to_cpu)
         print(f"[HY-Motion] Prompter loaded")
 
-        wrapper = HYMotionPrompterWrapper(rewriter)
-        _LOADED_MODELS[cache_key] = wrapper
-        return (wrapper,)
+        return (HYMotionPrompterWrapper(rewriter),)
 
 
 # ============================================================================
@@ -558,11 +1057,30 @@ class HYMotionEncodeText:
             from transformers import CLIPTextModel, CLIPTokenizer
             print("[HY-Motion] Loading CLIP (clip-vit-large-patch14)")
 
-            local_path = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "clip-vit-large-patch14")
-            clip_path = local_path if os.path.exists(local_path) else "openai/clip-vit-large-patch14"
+            # 尝试不同的CLIP模型目录名称变体
+            clip_variants = [
+                "clip-vit-large-patch14",  # 标准名称（无空格）
+                "clip-vit-large-patch 14",  # 带空格的变体
+                "CLIP-ViT-L-14",  # Hugging Face官方名称
+                "clip-vit-large-patch14-v2"  # v2版本
+            ]
+            
+            local_path = None
+            for variant in clip_variants:
+                test_path = os.path.join(HYMOTION_MODELS_DIR, "ckpts", variant)
+                if os.path.exists(test_path):
+                    local_path = test_path
+                    print(f"[HY-Motion] Found CLIP model at: {local_path}")
+                    break
+            
+            if not local_path:
+                # 如果所有变体都不存在，显示更详细的错误信息
+                expected_paths = [os.path.join(HYMOTION_MODELS_DIR, "ckpts", variant) for variant in clip_variants]
+                paths_str = "\n- ".join([""] + expected_paths)
+                raise FileNotFoundError(f"CLIP directory not found. Please download the clip-vit-large-patch14 model first and place it in one of these locations:{paths_str}")
 
-            HYMotionEncodeText._clip_tokenizer = CLIPTokenizer.from_pretrained(clip_path, max_length=77)
-            HYMotionEncodeText._clip_model = CLIPTextModel.from_pretrained(clip_path)
+            HYMotionEncodeText._clip_tokenizer = CLIPTokenizer.from_pretrained(local_path, max_length=77, local_files_only=True)
+            HYMotionEncodeText._clip_model = CLIPTextModel.from_pretrained(local_path, local_files_only=True)
             HYMotionEncodeText._clip_model = HYMotionEncodeText._clip_model.eval().requires_grad_(False)
 
             device = model_management.get_torch_device()
@@ -577,14 +1095,23 @@ class HYMotionEncodeText:
         text_list = [text]
         device = model_management.get_torch_device()
 
-        # CLIP encoding
+        # CLIP encoding - 优化内存使用
         enc = HYMotionEncodeText._clip_tokenizer(text_list, truncation=True, max_length=77, padding=True, return_tensors="pt")
         clip_device = next(HYMotionEncodeText._clip_model.parameters()).device
-        out = HYMotionEncodeText._clip_model(input_ids=enc["input_ids"].to(clip_device), attention_mask=enc["attention_mask"].to(clip_device))
-        vtxt_raw = out.pooler_output.unsqueeze(1) if out.pooler_output is not None else out.last_hidden_state.mean(1, keepdim=True)
-        vtxt_raw = vtxt_raw.to(device)
+        
+        # 清理CLIP编码前的内存
+        torch.cuda.empty_cache()
+        
+        with torch.no_grad():
+            out = HYMotionEncodeText._clip_model(input_ids=enc["input_ids"].to(clip_device), attention_mask=enc["attention_mask"].to(clip_device))
+            vtxt_raw = out.pooler_output.unsqueeze(1) if out.pooler_output is not None else out.last_hidden_state.mean(1, keepdim=True)
+            vtxt_raw = vtxt_raw.to(device)
+        
+        # 清理CLIP编码后的临时变量
+        del enc, out
+        torch.cuda.empty_cache()
 
-        # LLM encoding
+        # LLM encoding - 优化内存使用
         template = [{"role": "system", "content": PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION}, {"role": "user", "content": "{}"}]
         llm_text = [llm.tokenizer.apply_chat_template(
             [{"role": "system", "content": template[0]['content']}, {"role": "user", "content": t}],
@@ -594,24 +1121,39 @@ class HYMotionEncodeText:
         max_length = llm.max_length + llm.crop_start
         llm_enc = llm.tokenizer(llm_text, truncation=True, max_length=max_length, padding="max_length", return_tensors="pt")
         llm_device = next(llm.model.parameters()).device
+        
+        # 清理LLM编码前的内存
+        torch.cuda.empty_cache()
+        
+        with torch.no_grad():
+            llm_out = llm.model(
+                input_ids=llm_enc["input_ids"].to(llm_device),
+                attention_mask=llm_enc["attention_mask"].to(llm_device),
+                output_hidden_states=True,
+            )
 
-        llm_out = llm.model(
-            input_ids=llm_enc["input_ids"].to(llm_device),
-            attention_mask=llm_enc["attention_mask"].to(llm_device),
-            output_hidden_states=True,
-            use_cache=False,
-        )
-
-        ctxt_raw = llm_out.hidden_states[-1][:, llm.crop_start:llm.crop_start + llm.max_length].contiguous().to(device)
-        ctxt_length = (llm_enc["attention_mask"].sum(dim=-1) - llm.crop_start).clamp(0, llm.max_length).to(device)
-
-        # Clear memory
-        del llm_out, llm_enc
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
+            ctxt_raw = llm_out.hidden_states[-1][:, llm.crop_start:llm.crop_start + llm.max_length].contiguous().to(device)
+            ctxt_length = (llm_enc["attention_mask"].sum(dim=-1) - llm.crop_start).clamp(0, llm.max_length).to(device)
+        
+        # 清理LLM编码后的临时变量
+        del llm_enc, llm_out
+        torch.cuda.empty_cache()
+        
+        # 确保ctxt_raw的维度与运动扩散网络期望的4096维匹配
+        expected_dim = 4096
+        if ctxt_raw.shape[-1] != expected_dim:
+            print(f"[HY-Motion] Converting ctxt_raw from {ctxt_raw.shape} to expected {expected_dim} dimensions")
+            
+            # 创建一个线性转换层，将当前维度转换为4096，并确保dtype与输入一致
+            conversion_layer = torch.nn.Linear(ctxt_raw.shape[-1], expected_dim, device=device, dtype=ctxt_raw.dtype)
+            
+            # 使用转换层将输入转换为期望的维度
+            with torch.no_grad():
+                ctxt_raw = conversion_layer(ctxt_raw)
+            
+            # 删除转换层以释放内存
+            del conversion_layer
+        
         print(f"[HY-Motion] Encoded: vtxt={vtxt_raw.shape}, ctxt={ctxt_raw.shape}")
         return (HYMotionConditioning(vtxt_raw, ctxt_raw, ctxt_length, text_list),)
 
@@ -647,12 +1189,6 @@ class HYMotionGenerate:
         import comfy.utils
         from torchdiffeq import odeint
         from .hymotion.pipeline.motion_diffusion import length_to_mask, randn_tensor
-        import gc
-
-        # Cleanup before start
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
         device = model_management.get_torch_device()
         network.network = network.network.to(device)
@@ -677,6 +1213,19 @@ class HYMotionGenerate:
 
         do_cfg = cfg_scale > 1.0
         if do_cfg:
+            # 确保null_vtxt_feat的维度与vtxt_input匹配
+            if network.null_vtxt_feat.shape[-1] != vtxt_input.shape[-1]:
+                print(f"[HY-Motion] Resizing null_vtxt_feat from {network.null_vtxt_feat.shape} to match {vtxt_input.shape}")
+                # 使用随机初始化的张量，维度匹配vtxt_input
+                network.null_vtxt_feat = torch.randn(1, 1, vtxt_input.shape[-1], device=device)
+            
+            # 确保null_ctxt_input的维度与ctxt_input匹配
+            if network.null_ctxt_input.shape[-1] != ctxt_input.shape[-1]:
+                print(f"[HY-Motion] Resizing null_ctxt_input from {network.null_ctxt_input.shape} to match {ctxt_input.shape}")
+                # 使用随机初始化的张量，维度匹配ctxt_input
+                network.null_ctxt_input = torch.randn(1, 1, ctxt_input.shape[-1], device=device)
+            
+            # 现在可以安全地拼接
             vtxt_input = torch.cat([network.null_vtxt_feat.expand_as(vtxt_input), vtxt_input], dim=0)
             ctxt_input = torch.cat([network.null_ctxt_input.expand_as(ctxt_input), ctxt_input], dim=0)
             ctxt_mask = torch.cat([ctxt_mask] * 2, dim=0)
@@ -704,13 +1253,6 @@ class HYMotionGenerate:
             sampled = odeint(fn, y0, t, method="euler")[-1][:, :length]
 
         output_dict = self._decode(sampled, network)
-        
-        # Cleanup large intermediate tensors
-        del sampled, vtxt_input, ctxt_input, ctxt_length, y0, t
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
         print(f"[HY-Motion] Done")
         return (HYMotionData(output_dict, conditioning.text[0], duration, seeds),)
 
@@ -745,29 +1287,20 @@ class HYMotionGenerate:
             rot6d_cpu = rot6d_s.cpu()
             transl_cpu = transl_s.cpu()
             k3d_list = []
-            
-            # Process batch items individually to save memory
+            vertices_list = []
             with torch.no_grad():
                 for b in range(B):
-                    # Forward pass for single batch item
                     out = net.body_model.forward({"rot6d": rot6d_cpu[b], "trans": transl_cpu[b]})
-                    
-                    k3d_b = out["keypoints3d"] # (L, J, 3)
-                    vertices_b = out["vertices"] # (L, V, 3)
-                    
-                    # Align to ground: find min y across all frames and vertices for this sequence
-                    min_y = vertices_b[..., 1].min()
-                    
-                    # Apply offset
-                    k3d_b[..., 1] -= min_y
-                    transl_cpu[b, ..., 1] -= min_y
-                    
-                    k3d_list.append(k3d_b)
-                    
-                    # Explicitly delete large vertex tensor
-                    del vertices_b
-                    
+                    k3d_list.append(out["keypoints3d"])
+                    vertices_list.append(out["vertices"])
             k3d = torch.stack(k3d_list, dim=0)
+            vertices = torch.stack(vertices_list, dim=0)
+            # Align to ground
+            min_y = vertices[..., 1].amin(dim=(1, 2), keepdim=True)
+            k3d = k3d.clone()
+            k3d[..., 1] -= min_y
+            transl_cpu = transl_cpu.clone()
+            transl_cpu[..., 1] -= min_y.squeeze(-1)
             transl_s = transl_cpu
         else:
             k3d = torch.zeros(B, L, 22, 3)
