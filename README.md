@@ -1,9 +1,5 @@
 # ComfyUI-HY-Motion1
 
-此版本扩展由 b站 点满兴趣的冒险者 修改。792818521@qq.com
-
-开放了大模型选择范围，修复了显存溢出等问题。完善了部署文档。
-
 A ComfyUI plugin based on [HY-Motion 1.0](https://github.com/Tencent-Hunyuan/HY-Motion-1.0) for text-to-3D human motion generation.
 
 ## Features
