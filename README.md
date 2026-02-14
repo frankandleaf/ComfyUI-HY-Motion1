@@ -56,7 +56,7 @@ ComfyUI/
 To use AWQ quantized models, install the auto-awq package:
 
 ```bash
-pip install auto-awq
+pip install autoawq
 ```
 
 If auto-awq installation fails, the system will automatically fall back to regular loading.
